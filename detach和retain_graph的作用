@@ -1,0 +1,61 @@
+[GAN训练中的detach和retain_graph的作用](https://zhuanlan.zhihu.com/p/43843694)  
+#retain_graph的作用  
+```
+##先更新判别器，在更新生成器  
+valid = torch.Tensor(imgs.size(0), 1).fill_(1.0).to(device) # 真实标签，都是1  
+fake = torch.Tensor(imgs.size(0), 1).fill_(0.0).to(device) # 假标签，都是0  
+#----------
+# 训练判别器
+#----------
+real_imgs = imgs.to(device)  
+z = torch.randn((imgs.shape[0], 100)).to(device) # 噪声  
+gen_imgs = generator(z) # 从噪声中生成假数据  
+pred_gen = discriminator(gen_imgs) # 判别器对假数据的输出  
+pred_real = discriminator(real_imgs) # 判别器对真数据的输出  
+optimizer_D.zero_grad() # 把判别器中所有参数的梯度归零  
+real_loss = adversarial_loss(pred_real, valid) # 判别器对真实样本的损失  
+fake_loss = adversarial_loss(pred_gen, fake) # 判别器对假样本的损失  
+d_loss = (real_loss + fake_loss) / 2  # 两项损失相加取平均  
+# 下面这行代码十分重要，将在正文着重讲解  
+#d_loss.backward()`
+d_loss.backward(retain_graph=True) # retain_graph 十分重要，否则计算图内存将会被释放  
+optimizer_D.step() # 判别器参数更新  
+#---------
+#训练生成器
+#---------
+#gen_imgs = generator(z)
+#pred_gen = discriminator(gen_imgs) 
+g_loss = adversarial_loss(pred_gen, valid) # 生成器的损失函数  
+optimizer_G.zero_grad() # 生成器参数梯度归零  
+g_loss.backward() # 生成器的损失函数梯度反向传播  
+optimizer_G.step() # 生成器参数更新  
+```  
+因为这段代码里面，generator的前向传播只进行了一次（即只有一个计算图），如果在d_loss.backward中不加retain_graph=True的话，backward后会将和他loss相关的计算图清空（因为d_loss和generator有关，因此关于generator的计算图部分会被清空），导致generator无法更新参数。如果不加retain_graph=True，我们也可以在训练生成器的时候再加一次generator的前向传播(代码中的#部分)，这样会生成新的关于前向传播的计算图，但是相比于上面的代码会多进行一次前向传播过程。  
+
+#使用detach的情况
+```
+valid = Variable(Tensor(imgs.size(0), 1).fill_(1.0), requires_grad=False) # 真实样本的标签，都是 1
+fake = Variable(Tensor(imgs.size(0), 1).fill_(0.0), requires_grad=False) # 生成样本的标签，都是 0
+real_imgs = Variable(imgs.type(Tensor))
+#----------
+# 训练判别器
+#----------
+optimizer_D.zero_grad() # 把生成器损失函数梯度反向传播时，顺带计算的判别器参数梯度清空
+real_loss = adversarial_loss(discriminator(real_imgs), valid) # 真样本+真标签：判别器损失
+fake_loss = adversarial_loss(discriminator(gen_imgs.detach()), fake) # 假样本+假标签：判别器损失
+d_loss = (real_loss + fake_loss) / 2  # 判别器总的损失函数
+d_loss.backward() # 判别器损失回传
+optimizer_D.step() # 判别器参数更新
+#-----------
+# 训练生成器
+#-----------
+optimizer_G.zero_grad() # 生成器参数梯度归零
+z = Variable(Tensor(np.random.normal(0, 1, (imgs.shape[0], opt.latent_dim)))) # 噪声
+gen_imgs = generator(z) # 根据噪声生成虚假样本
+g_loss = adversarial_loss(discriminator(gen_imgs), valid) # 用真实的标签+假样本，计算生成器损失
+g_loss.backward() # 生成器梯度反向传播，反向传播经过了判别器，故此时判别器参数也有梯度
+optimizer_G.step() # 生成器参数更新，判别器参数虽然有梯度，但是这一步不能更新判别器
+```  
+fake_loss = adversarial_loss(discriminator(gen_imgs.detach()), fake)中的detach是将梯度截断在gen_imgs，即discriminator相关的loss产生的梯度不会在通过gen_imgs回传到整个generator里面去，其实做这一步的目的是为了加快训练速度，因为不需要在在训练discriminator由gen_imgs带来的关于generator的梯度，不加这一步对结果不会有影响，因为我们在训练generator的时候已经将generator的梯度清零。  
+以上的两种方法各有利弊，第一种方法只需要generator进行一次前向传播，但是需要保留计算图；第二种方法需要进行discriminator针对generator产生的fake data进行两次前向传播，但是在训练discriminator的时候不需要保留计算图。  
+针对于generator的规模远大于discriminator的情况，使用第二种策略更好
